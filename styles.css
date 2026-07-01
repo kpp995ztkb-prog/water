@@ -1,0 +1,105 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter, "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    sans-serif;
+  /* 雨天春水的冷青底，带一点暖意 */
+  background: oklch(16% 0.018 200);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  touch-action: none;
+  background:
+    radial-gradient(circle at 50% 38%, oklch(70% 0.06 190 / 0.14), transparent 46%),
+    linear-gradient(150deg, oklch(20% 0.02 205), oklch(24% 0.024 188) 48%, oklch(17% 0.018 210));
+}
+
+.stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  cursor: none;
+  user-select: none;
+}
+
+#camera,
+#water,
+.mist,
+.vignette {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#camera {
+  object-fit: cover;
+  transform: scaleX(-1);
+  /* 真实画面由 WebGL 采样后绘制，原始 video 不直接露出 */
+  opacity: 0;
+}
+
+#water {
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* 一层薄雾，模拟下雨天的柔光与空气感 */
+.mist {
+  z-index: 2;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 40%, oklch(96% 0.02 190 / 0.06), transparent 42%),
+    linear-gradient(180deg, oklch(94% 0.02 195 / 0.04), oklch(20% 0.02 205 / 0.05));
+  mix-blend-mode: screen;
+  opacity: 0.6;
+}
+
+/* 边缘暗角，把视线收向水心 */
+.vignette {
+  z-index: 3;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at 50% 46%,
+    transparent 52%,
+    oklch(12% 0.015 205 / 0.42) 100%
+  );
+  mix-blend-mode: multiply;
+}
+
+.hint {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  margin: 0;
+  padding: 0;
+  transform: translateX(-50%);
+  color: oklch(94% 0.02 195 / 0.78);
+  font-size: clamp(11px, 1.8vw, 13px);
+  font-weight: 300;
+  letter-spacing: 0.02em;
+  line-height: 1.6;
+  text-shadow: 0 1px 20px oklch(10% 0.015 205 / 0.7);
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 0.8s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hint {
+    transition: none;
+  }
+}
