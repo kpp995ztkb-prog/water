@@ -19,7 +19,7 @@ const gl = canvas.getContext("webgl", {
   preserveDrawingBuffer: false,
 });
 
-const MAX_SOURCES = 8; // 每帧最多注入的波源数量
+const MAX_SOURCES = 16; // 每帧最多注入的波源数量（V形尾波需要更多槽位）
 
 // ---- 运行状态 ----
 const pointer = {
@@ -39,6 +39,18 @@ const handState = {
   hasSmoothPoint: false,
   seenAt: 0,
   ready: false,
+  gesture: "none",       // "index" | "palm" | "none"
+  flowerCooldown: 0,     // 下次可以生花的时间戳（ms）
+  palmX: 0,
+  palmY: 0,
+  // 新增：手指停留检测
+  lastMoveTime: 0,
+  hoverX: 0,
+  hoverY: 0,
+  isHovering: false,
+  // 新增：速度轨迹效果
+  lastSpeed: 0,
+  trailCooldown: 0,
 };
 
 let width = 0;
@@ -56,6 +68,9 @@ let videoFrameReady = false;
 
 // 本帧待注入的波源：{ x, y (sim uv 0..1), radius, strength }
 const sources = [];
+
+// 正在绽放的花朵队列（每朵花分 3 个阶段注入，营造"绽开"动画感）
+const activeFlowers = [];
 
 // WebGL 资源
 let simProgram = null;
@@ -139,35 +154,39 @@ const SIM_FRAGMENT = `
     float hd = texture2D(u_prev, uv - vec2(0.0, u_texel.y)).r;
 
     // 离散拉普拉斯 → 加速度
+    // 系数降到 0.22：波速更慢，涟漪范围更小更subtle
     float laplacian = (hl + hr + hu + hd) - 4.0 * h;
-    vel += laplacian * 0.48;
+    vel += laplacian * 0.22;
 
     // 注入手指/指针带来的扰动
+    // src.w 可为负值（手指划过处产生凹陷，两侧被推高）
     for (int i = 0; i < ${MAX_SOURCES}; i++) {
       if (i >= u_sourceCount) break;
       vec4 src = u_sources[i];
       vec2 d = uv - src.xy;
       d.x *= u_aspect;
-      float r = max(src.z, 0.0008);
+      float r = max(src.z, 0.0006);
       float falloff = exp(-dot(d, d) / (r * r));
       vel += falloff * src.w;
     }
 
-    vel *= 0.9965;   // 速度阻尼，让水面缓缓平息
+    // 速度阻尼：0.982 快速衰减，让涟漪更克制
+    vel *= 0.9820;
     h += vel;
-    h *= 0.9992;     // 高度回落，避免能量长期堆积
+    // 高度快速回落
+    h *= 0.9965;
 
-    // 边缘软衰减：靠近四边时压低能量，得到柔和而非生硬的反射
+    // 边缘软衰减：靠近四边时压低能量，得到柔和反射而非生硬弹回
     vec2 edge = min(uv, 1.0 - uv);
-    float border = smoothstep(0.0, 0.045, min(edge.x, edge.y));
-    h *= mix(0.92, 1.0, border);
-    vel *= mix(0.92, 1.0, border);
+    float border = smoothstep(0.0, 0.055, min(edge.x, edge.y));
+    h   *= mix(0.88, 1.0, border);
+    vel *= mix(0.88, 1.0, border);
 
     gl_FragColor = vec4(h, vel, 0.0, 1.0);
   }
 `;
 
-// 渲染 pass：用高度场法线折射摄像头画面 + 焦散高光 + 冷暖微光
+// 渲染 pass：用高度场法线折射摄像头画面 + 色散 + 多层焦散 + 细腻光影
 const RENDER_FRAGMENT = `
   precision highp float;
 
@@ -179,7 +198,6 @@ const RENDER_FRAGMENT = `
   uniform float u_time;
   varying vec2 v_uv;
 
-  // cover 映射 + 水平镜像，使摄像头铺满且符合“照镜子”的方向
   vec2 coverUv(vec2 screenUv) {
     vec2 ratio = vec2(
       max((u_resolution.x / u_resolution.y) / (u_videoSize.x / u_videoSize.y), 1.0),
@@ -197,38 +215,89 @@ const RENDER_FRAGMENT = `
     float hr = texture2D(u_sim, uv + vec2(u_texel.x, 0.0)).r;
     float hu = texture2D(u_sim, uv + vec2(0.0, u_texel.y)).r;
     float hd = texture2D(u_sim, uv - vec2(0.0, u_texel.y)).r;
-    float h = texture2D(u_sim, uv).r;
+    float h  = texture2D(u_sim, uv).r;
 
-    // 由高度梯度求水面法线
+    float hlu = texture2D(u_sim, uv + vec2(-u_texel.x, u_texel.y)).r;
+    float hru = texture2D(u_sim, uv + vec2(u_texel.x, u_texel.y)).r;
+    float hld = texture2D(u_sim, uv + vec2(-u_texel.x, -u_texel.y)).r;
+    float hrd = texture2D(u_sim, uv + vec2(u_texel.x, -u_texel.y)).r;
+
     vec2 grad = vec2(hl - hr, hd - hu);
-    vec3 normal = normalize(vec3(grad * 9.0, 1.0));
+    grad += vec2((hlu + hld) - (hru + hrd), (hlu + hru) - (hld + hrd)) * 0.5;
+    vec3 normal = normalize(vec3(grad * 14.0, 1.0));
 
-    float activity = clamp(length(grad) * 12.0, 0.0, 1.0);
+    float gradLen = length(grad);
+    float activity = clamp(gradLen * 18.0, 0.0, 1.0);
 
-    // 折射：沿法线水平分量偏移采样坐标
-    vec2 refractOffset = normal.xy * 0.42;
+    float curvature = (hl + hr + hu + hd - 4.0 * h) * 0.5;
+    float curvatureIntensity = clamp(abs(curvature) * 100.0, 0.0, 1.0);
+
+    float refrStr = 0.012 + activity * 0.010;
+    vec2 refractOffset = normal.xy * refrStr;
+
     vec2 base = coverUv(uv);
-    vec2 soft = coverUv(uv + refractOffset * 0.018 + vec2(0.0012, -0.0008));
-    vec3 color = texture2D(u_video, clamp(base + refractOffset * 0.02, 0.001, 0.999)).rgb;
-    vec3 softened = texture2D(u_video, clamp(soft, 0.001, 0.999)).rgb;
-    color = mix(color, softened, clamp(activity * 0.5, 0.0, 0.4)); // 起伏处更柔，似雨雾
+    float disperseScale = 0.15;
+    vec2 rOffset = refractOffset * (1.0 + disperseScale * 0.008);
+    vec2 gOffset = refractOffset;
+    vec2 bOffset = refractOffset * (1.0 - disperseScale * 0.008);
 
-    // 焦散 / 镜面高光
-    vec3 lightDir = normalize(vec3(0.35, 0.55, 0.9));
-    float spec = pow(max(dot(normal, lightDir), 0.0), 28.0);
-    float crest = clamp(h * 6.0, 0.0, 1.0);
-    color += vec3(0.85, 0.95, 0.92) * spec * 0.5;
-    color += vec3(0.6, 0.8, 0.78) * crest * 0.06;
+    float r = texture2D(u_video, clamp(base + rOffset, 0.001, 0.999)).r;
+    float g = texture2D(u_video, clamp(base + gOffset, 0.001, 0.999)).g;
+    float b = texture2D(u_video, clamp(base + bOffset, 0.001, 0.999)).b;
+    vec3 color = vec3(r, g, b);
 
-    // 冷暖微光：暗部偏青，活跃处透出一点暖意
-    color = mix(color, color * vec3(0.92, 1.01, 1.04), 0.5);            // 整体偏青绿
-    color = mix(color, color * vec3(1.06, 1.0, 0.9), activity * 0.25);   // 涟漪带暖
-    color += vec3(0.012, 0.014, 0.013);
+    if (activity > 0.5) {
+      vec2 refracted2 = coverUv(uv + refractOffset * 1.15 + vec2(0.0005, -0.0004));
+      vec3 refractC = texture2D(u_video, clamp(refracted2, 0.001, 0.999)).rgb;
+      color = mix(color, refractC, clamp(activity * 0.18, 0.0, 0.18));
+    }
 
-    // 极轻的水面波光，避免画面太“数码”
-    float sheen =
-      pow(max(0.0, sin(uv.x * 14.0 + uv.y * 11.0 + u_time * 0.3)), 20.0) * 0.012;
-    color += vec3(sheen);
+    vec3 L1 = normalize(vec3( 0.42,  0.58, 0.92));
+    vec3 L2 = normalize(vec3(-0.48,  0.28, 0.86));
+
+    float spec1 = pow(max(dot(normal, L1), 0.0), 38.0) * 0.6;
+    float spec2 = pow(max(dot(normal, L2), 0.0), 24.0) * 0.25;
+
+    float fresnel = pow(1.0 - clamp(normal.z, 0.0, 1.0), 1.8);
+
+    vec3 specColor = vec3(0.95, 0.93, 0.90);
+    color += specColor * (spec1 + spec2) * (0.35 + fresnel * 0.30);
+
+    float crest = clamp(h * 9.0, 0.0, 1.0);
+    float gradAngle = atan(grad.y, grad.x + 0.0001);
+
+    float caustic1 = pow(max(0.0,
+      sin(uv.x * 24.0 - uv.y * 10.0 + u_time * 0.48 + gradAngle * 2.5)
+    ), 18.0) * 0.5;
+
+    float caustic2 = pow(max(0.0,
+      sin(uv.x * 17.0 + uv.y * 20.0 - u_time * 0.38 - gradAngle * 1.4)
+    ), 22.0) * 0.3;
+
+    float causticTotal = caustic1 + caustic2;
+
+    vec3 causticColor = vec3(0.93, 0.90, 0.85);
+    color += causticColor * causticTotal * crest * 0.08;
+
+    color += vec3(0.025, 0.024, 0.023) * crest * 0.25;
+    float trough = clamp(-h * 7.0, 0.0, 1.0);
+    color *= 1.0 - trough * 0.04;
+
+    float edgeGlow = curvatureIntensity * activity * 0.05;
+    color += vec3(0.88, 0.86, 0.84) * edgeGlow;
+
+    color = mix(color, color * vec3(1.015, 1.00, 0.99), activity * 0.12);
+    color += vec3(0.006, 0.006, 0.005);
+
+    float shimmer1 = pow(max(0.0,
+      sin(uv.x * 15.0 + uv.y * 13.0 + u_time * 0.38)),
+      30.0) * 0.008;
+
+    float shimmer2 = pow(max(0.0,
+      sin(uv.x * 32.0 - uv.y * 28.0 + u_time * 0.68)),
+      40.0) * 0.005;
+
+    color += vec3(0.96, 0.95, 0.92) * (shimmer1 + shimmer2);
 
     gl_FragColor = vec4(color, 1.0);
   }
@@ -367,10 +436,10 @@ function resize() {
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
 
-  // 重建模拟网格：固定高度，宽度按屏幕比例，保持近似方形的网格单元
+  // 重建模拟网格：分辨率从 256 提升到 320，让细波纹有足够精度
   const aspect = width / height;
-  simH = 256;
-  simW = clamp(Math.round(simH * aspect), 96, 512);
+  simH = 320;
+  simW = clamp(Math.round(simH * aspect), 120, 640);
 
   // 释放旧目标
   for (const t of simTextures) gl.deleteTexture(t);
@@ -421,7 +490,7 @@ async function setupHandTracking() {
       minHandPresenceConfidence: 0.45,
       minTrackingConfidence: 0.45,
     });
-    hint.textContent = "伸出食指，轻轻拂过这池春水";
+    hint.textContent = "食指划过水面 · 五指张开唤出水花";
   } catch {
     hint.textContent = "手势模型加载失败，先用鼠标拂过水面试试";
   }
@@ -436,24 +505,54 @@ async function scanHand(time) {
   try {
     const results = handState.detector.detectForVideo(video, time);
     const landmarks = results.landmarks?.[0];
-    if (!landmarks) return;
-
-    const indexTip = landmarks[8];
-    // 显示是镜像的，所以横坐标取反
-    const tipX = (1 - indexTip.x) * width;
-    const tipY = indexTip.y * height;
-
-    if (!handState.hasSmoothPoint) {
-      handState.smoothX = tipX;
-      handState.smoothY = tipY;
-      handState.hasSmoothPoint = true;
+    if (!landmarks) {
+      handState.gesture = "none";
+      return;
     }
-    handState.smoothX += (tipX - handState.smoothX) * 0.5;
-    handState.smoothY += (tipY - handState.smoothY) * 0.5;
+
+    // 检测有多少根手指伸出（通过指尖与关节的相对位置判断）
+    const isThumbOut = Math.abs(landmarks[4].x - landmarks[2].x) > 0.08;
+    const isIndexOut = landmarks[8].y < landmarks[6].y - 0.05;
+    const isMiddleOut = landmarks[12].y < landmarks[10].y - 0.05;
+    const isRingOut = landmarks[16].y < landmarks[14].y - 0.05;
+    const isPinkyOut = landmarks[20].y < landmarks[18].y - 0.05;
+    const extendedCount = [isThumbOut, isIndexOut, isMiddleOut, isRingOut, isPinkyOut]
+      .filter(Boolean).length;
+
+    // 判断手势类型
+    const now = performance.now();
+    if (extendedCount >= 4) {
+      // 张开手掌：生成花朵图案
+      handState.gesture = "palm";
+      const palmX = (1 - landmarks[9].x) * width;   // 中指根部作为掌心
+      const palmY = landmarks[9].y * height;
+      handState.palmX = palmX;
+      handState.palmY = palmY;
+
+      if (now >= handState.flowerCooldown) {
+        spawnFlower(palmX, palmY);
+        handState.flowerCooldown = now + 650;  // 650ms 冷却，避免过于频繁
+      }
+    } else if (isIndexOut && extendedCount <= 2) {
+      // 单指模式：食指划水
+      handState.gesture = "index";
+      const tipX = (1 - landmarks[8].x) * width;
+      const tipY = landmarks[8].y * height;
+
+      if (!handState.hasSmoothPoint) {
+        handState.smoothX = tipX;
+        handState.smoothY = tipY;
+        handState.hasSmoothPoint = true;
+      }
+      handState.smoothX += (tipX - handState.smoothX) * 0.62;
+      handState.smoothY += (tipY - handState.smoothY) * 0.62;
+      feedPoint(handState.smoothX, handState.smoothY, 1);
+    } else {
+      handState.gesture = "none";
+    }
 
     handState.ready = true;
-    handState.seenAt = performance.now();
-    feedPoint(handState.smoothX, handState.smoothY, 1);
+    handState.seenAt = now;
   } catch {
     handState.detector = null;
     hint.textContent = "手势识别运行失败，先用鼠标拂过水面试试";
@@ -473,13 +572,20 @@ function pushSource(x, y, radius, strength) {
   });
 }
 
-// 根据移动速度，把一个点转化为连续的拂水扰动
+// 根据移动速度，注入极窄的高密度单线波源——使水面保留清晰的手指轨迹纹路
+// 物理逻辑：
+//   • 极小注入半径（0.004~0.008）+ 高密度插值 = 路径上形成连续细线扰动
+//   • 较慢的波速（laplacian 0.28）确保波纹不会迅速向外扩散稀释
+//   • 结果：可以清楚看出一根手指划过的具体路径和方向
 function feedPoint(x, y, confidence) {
   const now = performance.now();
   if (!pointer.seen) {
     pointer.x = x;
     pointer.y = y;
     pointer.seen = true;
+    pointer.movedAt = now;
+    handState.lastMoveTime = now;
+    return;
   }
   pointer.px = pointer.x;
   pointer.py = pointer.y;
@@ -487,10 +593,170 @@ function feedPoint(x, y, confidence) {
   pointer.y = y;
   pointer.movedAt = now;
 
-  const speed = Math.hypot(x - pointer.px, y - pointer.py);
-  if (speed > 0.4) {
-    const strength = clamp(0.015 + speed * 0.0012, 0.015, 0.09) * confidence;
-    pushSource(x, y, 0.012, strength);
+  const dx = x - pointer.px;
+  const dy = y - pointer.py;
+  const speed = Math.hypot(dx, dy);
+
+  if (speed < 0.1) return;
+
+  // 每 3.5 像素注入一个波源，确保轨迹连续无断点
+  const steps = Math.min(Math.max(Math.round(speed / 3.5), 1), MAX_SOURCES - 1);
+
+  for (let s = 0; s < steps; s++) {
+    const t  = (s + 0.5) / steps;
+    const ix = pointer.px + dx * t;
+    const iy = pointer.py + dy * t;
+
+    // 极窄半径：在模拟网格上对应 1.5~2 个像素，轨迹非常纤细
+    const radius   = clamp(0.004 + speed * 0.00010, 0.004, 0.008);
+    // 强度随速度增强：划得快，波纹越深
+    const strength = clamp(0.085 + speed * 0.0030, 0.085, 0.22) * confidence;
+
+    pushSource(ix, iy, radius, strength);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 花朵涟漪：五指张开时在掌心生成水波小花
+// 设计理念：清晰的花瓣边界 + 水的流动感 + 真实物理 + 视觉美感
+// ---------------------------------------------------------------------------
+
+// 将一朵花加入队列（cx/cy 为掌心屏幕像素坐标）
+function spawnFlower(cx, cy) {
+  const numPetals = 5; // 固定5片花瓣，像参考图
+  const pSize = Math.min(width, height) * (0.10 + Math.random() * 0.04);
+
+  activeFlowers.push({
+    cx,
+    cy,
+    baseAngle: Math.random() * Math.PI * 2,
+    pSize,
+    numPetals,
+    phase: 0,
+  });
+}
+
+// 每帧调用：生成像参考图那样清晰的5瓣水花
+function tickFlowers() {
+  for (let i = activeFlowers.length - 1; i >= 0; i--) {
+    const f = activeFlowers[i];
+    const t = f.phase;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 阶段 0: 花心（小圆形凹陷）
+    // ═══════════════════════════════════════════════════════════════════════
+    if (t === 0) {
+      pushSource(f.cx, f.cy, 0.032, -0.28);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 阶段 1-2: 花心外围（形成圆润的中心）
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (t === 1) {
+      const numCenter = 6;
+      for (let k = 0; k < numCenter; k++) {
+        const a = (k / numCenter) * Math.PI * 2;
+        const r = f.pSize * 0.12;
+        pushSource(
+          f.cx + Math.cos(a) * r,
+          f.cy + Math.sin(a) * r,
+          0.018, -0.16
+        );
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 阶段 2-6: 5片花瓣主体形成（清晰的边界线）
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (t >= 2 && t <= 6) {
+      const progress = (t - 2) / 4; // 0 到 1
+
+      for (let k = 0; k < f.numPetals; k++) {
+        const a = f.baseAngle + (k / f.numPetals) * Math.PI * 2;
+
+        // 花瓣长度逐渐增长
+        const rMax = f.pSize * (0.35 + progress * 0.50);
+
+        // ═══ 花瓣中心线（暗色主体）═══
+        const numSpine = 4;
+        for (let j = 0; j < numSpine; j++) {
+          const spineT = j / (numSpine - 1);
+          const r = rMax * spineT;
+
+          pushSource(
+            f.cx + Math.cos(a) * r,
+            f.cy + Math.sin(a) * r,
+            0.016,
+            -0.12 * (1.0 - spineT * 0.3)
+          );
+        }
+
+        // ═══ 花瓣边缘（亮边轮廓）═══
+        if (t >= 3) {
+          const edgeProgress = Math.min((t - 3) / 3, 1.0);
+          const perpAngle = a + Math.PI * 0.5;
+
+          // 沿花瓣长度方向的边缘点
+          const numEdge = 5;
+          for (let j = 0; j < numEdge; j++) {
+            const edgeT = j / (numEdge - 1);
+            const r = rMax * edgeT * edgeProgress;
+
+            // 花瓣宽度：根部宽，尖端窄
+            const width = f.pSize * 0.18 * Math.sin(edgeT * Math.PI * 0.65);
+
+            // 左右边界
+            for (let side of [-1, 1]) {
+              pushSource(
+                f.cx + Math.cos(a) * r + Math.cos(perpAngle) * width * side,
+                f.cy + Math.sin(a) * r + Math.sin(perpAngle) * width * side,
+                0.012,
+                0.14
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 阶段 7-9: 花瓣尖端高光
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (t >= 7 && t <= 9) {
+      for (let k = 0; k < f.numPetals; k++) {
+        const a = f.baseAngle + (k / f.numPetals) * Math.PI * 2;
+        const r = f.pSize * 0.88;
+
+        pushSource(
+          f.cx + Math.cos(a) * r,
+          f.cy + Math.sin(a) * r,
+          0.011,
+          0.18
+        );
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 阶段 10-12: 外围柔和扩散
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (t >= 10 && t <= 12) {
+      const ringProgress = (t - 10) / 2;
+      const numRing = f.numPetals * 3;
+      const ringR = f.pSize * (1.10 + ringProgress * 0.25);
+
+      for (let k = 0; k < numRing; k++) {
+        const a = (k / numRing) * Math.PI * 2;
+        pushSource(
+          f.cx + Math.cos(a) * ringR,
+          f.cy + Math.sin(a) * ringR,
+          0.012,
+          0.05 - ringProgress * 0.02
+        );
+      }
+    }
+
+    f.phase++;
+    if (f.phase > 14) activeFlowers.splice(i, 1);
   }
 }
 
@@ -498,8 +764,9 @@ function bindInput() {
   // 安静的指针兜底：主要用于桌面调试 / 摄像头不可用时
   window.addEventListener("pointermove", (e) => feedPoint(e.clientX, e.clientY, 0.9));
   window.addEventListener("pointerdown", (e) => {
+    // 点触入水：先注入一个 feedPoint 跟新逻辑同步，再叠加一个扩散圆环模拟"入水一点"
     feedPoint(e.clientX, e.clientY, 1);
-    pushSource(e.clientX, e.clientY, 0.02, 0.12);
+    pushSource(e.clientX, e.clientY, 0.032, 0.14);
   });
 }
 
@@ -574,11 +841,12 @@ function uploadVideoFrame() {
 function updateHint(time) {
   if (time - lastHintUpdate < 600) return;
   lastHintUpdate = time;
-  if (handState.ready && performance.now() - handState.seenAt < 1400) {
+  const recentlySeen = handState.ready && performance.now() - handState.seenAt < 1400;
+  if (recentlySeen) {
     hint.style.opacity = "0";
   } else if (handState.detector) {
     hint.style.opacity = "1";
-    hint.textContent = "伸出食指，轻轻拂过这池春水";
+    hint.textContent = "食指划过水面 · 五指张开唤出水花";
   }
 }
 
@@ -588,7 +856,8 @@ function animate(time) {
 
   const hasVideo = uploadVideoFrame();
 
-  // 每帧跑两步模拟：更稳、波纹更顺滑；只在第一步注入波源
+  // 每帧先推进花朵绽放动画，再跑两步物理模拟
+  tickFlowers();
   stepSimulation(true);
   stepSimulation(false);
   sources.length = 0;
